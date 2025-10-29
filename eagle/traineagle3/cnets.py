@@ -30,6 +30,12 @@ from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer
 from modeling_llama_kv import LlamaForCausalLM
+try:
+    from transformers import Qwen2ForCausalLM
+    HAS_QWEN = True
+except:
+    HAS_QWEN = False
+    print("Warning: Qwen2ForCausalLM not available in transformers")
 from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
@@ -478,25 +484,43 @@ def merge_dicts(dicts):
 
 
 class Model(nn.Module):
-    def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None):
-        super().__init__() 
+    def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None, model_type="llama"):
+        super().__init__()
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
         self.train_config = training_config
+        self.model_type = model_type
         # Settng dschf to allow efficient ZeRO-3 usage between hf and ds.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
             dschf = HfDeepSpeedConfig(ds_config)
         else:
             dschf = None
         self.midlayer = LlamaDecoderLayeremb(config)
-        self.gradient_checkpointing = self.train_config.gradient_checkpointing
+        # Handle both dict and object train_config
+        if isinstance(self.train_config, dict):
+            self.gradient_checkpointing = self.train_config.get("gradient_checkpoint", False)
+            self.max_len = self.train_config.get("max_len", 2048)
+        else:
+            self.gradient_checkpointing = self.train_config.gradient_checkpointing
+            self.max_len = self.train_config.max_len
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+
+        # Load model based on type
+        if model_type == "qwen" and HAS_QWEN:
+            print(f"Loading Qwen2 model from {path}")
+            self.target_model = Qwen2ForCausalLM.from_pretrained(
+                path,
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            )
+        else:
+            print(f"Loading LLaMA model from {path}")
+            self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -518,14 +542,19 @@ class Model(nn.Module):
                                framework="pt",
                                device="cpu") as f:
                     tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
+                    actual_vocab_size, actual_hidden_dim = tensor_slice.get_shape()
+                    print(f"Loading embeddings: actual shape ({actual_vocab_size}, {actual_hidden_dim}), config ({config.vocab_size}, {config.hidden_size})")
+                    # Load full tensor without slicing
+                    tensor = tensor_slice[:].float()
+            except Exception as e:
+                print(f"Failed to load from safetensors, trying pytorch_model.bin: {e}")
                 with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
                 weights = torch.load(os.path.join(path, emb_path))
                 tensor = weights["model.embed_tokens.weight"].float()
+
+            print(f"Loaded embedding tensor shape: {tensor.shape}")
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor)
 
         self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
@@ -588,7 +617,7 @@ class Model(nn.Module):
                     # When construct draft model vocab, 
                     # filter out samples which is longer than max_len,
                     # instead of truncating them.
-                    if len(input_ids) > self.train_config.max_len:
+                    if len(input_ids) > self.max_len:
                         continue
                     loss_mask = torch.ones_like(input_ids)
                     # print(i)

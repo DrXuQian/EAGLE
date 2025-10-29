@@ -8,6 +8,8 @@ parser.add_argument('--trainpath', type=str,
 parser.add_argument('--testpath', type=str,
                     default="/home/lyh/code/nlp/developing/vllmbase/vllm/gedata/0318.json")
 parser.add_argument('--savedir', type=str, default='0')
+parser.add_argument('--model_type', type=str, default='llama', choices=['llama', 'qwen'],
+                    help='Model architecture type: llama or qwen')
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -22,7 +24,7 @@ train_config = {
     "num_epochs": 40,
     "num_workers": 2,
     "max_len": 2048,
-    "config_path": "config.json",
+    "config_path": "config_qwen25_3b.json" if args.model_type == "qwen" else "config.json",
     "gradient_checkpoint": True
 }
 
@@ -53,7 +55,7 @@ from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmu
 
 
 def build_dataset_rank(
-        tokenizer, datapath
+        tokenizer, datapath, model_type="llama"
 ):
 
     ds = load_dataset('json', data_files=datapath)
@@ -110,12 +112,24 @@ def build_dataset_rank(
             loss_mask = torch.ones_like(input_ids)
             # print(i)
 
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            # Detect model type from tokenizer or use chat template markers
+            if model_type == "qwen" or "<|im_start|>" in conversation:
+                # Qwen chat template format
+                sep = "<|im_start|>assistant\n"
+                sep2 = "<|im_start|>user\n"
+            else:
+                # LLaMA chat template format
+                sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
 
             total_len = len(input_ids)
 
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
             turns = conversation.split(sep2)
+
+            # Handle edge cases
+            if len(turns) < 2:
+                # Skip samples that don't have proper conversation structure
+                continue
 
             turns[1] = turns[0] + sep2 + turns[1]
             turns = turns[1:]
@@ -203,11 +217,11 @@ class DataCollatorWithPadding:
 
 
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-traindataset = build_dataset_rank(tokenizer, args.trainpath)
-testdataset = build_dataset_rank(tokenizer, args.testpath)
+traindataset = build_dataset_rank(tokenizer, args.trainpath, model_type=args.model_type)
+testdataset = build_dataset_rank(tokenizer, args.testpath, model_type=args.model_type)
 
 config = EConfig.from_pretrained(train_config["config_path"])
-model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
+model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True, model_type=args.model_type)
 model.scandata(args.trainpath, args.basepath)
 
 
